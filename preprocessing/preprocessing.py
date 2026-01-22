@@ -4,7 +4,7 @@ Data Preprocessing Pipeline for CBT Prediction Platform
 This script prepares raw data for the training pipeline by:
 1. Reading raw data files from categorized folders
 2. Normalizing column names and formats
-3. Converting units (F to C for environmental, Central to UTC for CBT)
+3. Converting ALL timestamps to UTC (handling DST for America/Chicago)
 4. Outputting files in the format expected by prepare_data.py
 
 Input Structure (raw_data/):
@@ -31,7 +31,7 @@ Output Structure (preprocessed_data/):
         environmental.csv
         cbt_labels.csv
 
-The output format matches what prepare_data.py and DataLoader expect.
+ALL OUTPUT TIMESTAMPS ARE IN UTC FORMAT: 2025-04-05T00:00:00Z
 """
 
 import pandas as pd
@@ -41,6 +41,7 @@ from typing import Dict, List, Optional, Tuple
 import re
 import warnings
 from datetime import datetime
+import pytz
 
 warnings.filterwarnings('ignore')
 
@@ -77,8 +78,239 @@ class Config:
     ENV_OUTPUT = "environmental.csv"
     CBT_OUTPUT = "cbt_labels.csv"
     
-    # Timezone for CBT data (manual measurements in local time)
+    # Timezone for local data (CBT, Environmental, Wrist Temp are in local time)
+    # Heart Rate from Fitbit is already in UTC
     LOCAL_TIMEZONE = "America/Chicago"
+    
+    # Standard output timestamp format
+    TIMESTAMP_OUTPUT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+# ============================================
+# TIMESTAMP UTILITIES
+# ============================================
+
+def parse_flexible_datetime(date_str: str, time_str: Optional[str] = None) -> Optional[datetime]:
+    """
+    Parse datetime from various formats.
+    
+    Handles:
+    - Date formats: YYYY-MM-DD, MM/DD/YYYY, MM/DD/YY, M/D/YYYY, M/D/YY
+    - Time formats: HH:MM:SS, HH:MM, H:MM AM/PM, HH:MM AM/PM
+    - Combined: YYYY-MM-DDTHH:MM, YYYY-MM-DD HH:MM:SS
+    
+    Args:
+        date_str: Date string or combined datetime string
+        time_str: Optional separate time string
+    
+    Returns:
+        datetime object or None if parsing fails
+    """
+    if pd.isna(date_str) or date_str is None:
+        return None
+    
+    date_str = str(date_str).strip()
+    
+    if time_str is not None and not pd.isna(time_str):
+        time_str = str(time_str).strip()
+        combined = f"{date_str} {time_str}"
+    else:
+        combined = date_str
+    
+    # List of formats to try (most specific first)
+    formats = [
+        # ISO formats (already has T separator)
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        
+        # Standard formats with space separator
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        
+        # US formats with 12-hour time
+        "%m/%d/%Y %I:%M:%S %p",
+        "%m/%d/%Y %I:%M %p",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y",
+        
+        # US formats with 2-digit year
+        "%m/%d/%y %I:%M:%S %p",
+        "%m/%d/%y %I:%M %p",
+        "%m/%d/%y %H:%M:%S",
+        "%m/%d/%y %H:%M",
+        "%m/%d/%y",
+        
+        # Formats without leading zeros
+        "%-m/%-d/%Y %I:%M %p",
+        "%-m/%-d/%Y %I:%M:%S %p",
+        "%-m/%-d/%y %I:%M %p",
+        "%-m/%-d/%y %I:%M:%S %p",
+    ]
+    
+    for fmt in formats:
+        try:
+            # Handle formats with %-m and %-d (no leading zeros) on Windows
+            # Windows doesn't support %-m, so we need to handle it differently
+            if "%-" in fmt:
+                continue  # Skip these, we'll handle with regex below
+            return datetime.strptime(combined, fmt)
+        except ValueError:
+            continue
+    
+    # Try parsing with regex for flexible formats
+    # Pattern for dates like "4/5/2025" or "04/05/2025"
+    date_pattern = r'^(\d{1,2})/(\d{1,2})/(\d{2,4})'
+    time_12h_pattern = r'(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM|am|pm)?'
+    time_24h_pattern = r'(\d{1,2}):(\d{2})(?::(\d{2}))?$'
+    
+    try:
+        date_match = re.match(date_pattern, combined)
+        if date_match:
+            month = int(date_match.group(1))
+            day = int(date_match.group(2))
+            year = int(date_match.group(3))
+            
+            # Handle 2-digit year
+            if year < 100:
+                year += 2000
+            
+            # Find time portion
+            time_portion = combined[date_match.end():].strip()
+            hour, minute, second = 0, 0, 0
+            
+            if time_portion:
+                # Try 12-hour format first
+                time_match = re.search(time_12h_pattern, time_portion, re.IGNORECASE)
+                if time_match:
+                    hour = int(time_match.group(1))
+                    minute = int(time_match.group(2))
+                    second = int(time_match.group(3)) if time_match.group(3) else 0
+                    ampm = time_match.group(4)
+                    
+                    if ampm:
+                        ampm = ampm.upper()
+                        if ampm == 'PM' and hour != 12:
+                            hour += 12
+                        elif ampm == 'AM' and hour == 12:
+                            hour = 0
+                else:
+                    # Try 24-hour format
+                    time_match = re.search(time_24h_pattern, time_portion)
+                    if time_match:
+                        hour = int(time_match.group(1))
+                        minute = int(time_match.group(2))
+                        second = int(time_match.group(3)) if time_match.group(3) else 0
+            
+            return datetime(year, month, day, hour, minute, second)
+    except (ValueError, AttributeError):
+        pass
+    
+    # Try ISO format with T separator
+    try:
+        if 'T' in combined:
+            # Remove Z suffix if present
+            clean = combined.rstrip('Z')
+            parts = clean.split('T')
+            if len(parts) == 2:
+                date_part = parts[0]
+                time_part = parts[1]
+                
+                date_components = date_part.split('-')
+                time_components = time_part.split(':')
+                
+                year = int(date_components[0])
+                month = int(date_components[1])
+                day = int(date_components[2])
+                hour = int(time_components[0])
+                minute = int(time_components[1])
+                second = int(time_components[2]) if len(time_components) > 2 else 0
+                
+                return datetime(year, month, day, hour, minute, second)
+    except (ValueError, IndexError):
+        pass
+    
+    return None
+
+
+def convert_local_to_utc(dt: datetime, local_tz_str: str = "America/Chicago") -> datetime:
+    """
+    Convert a naive local datetime to UTC.
+    
+    Handles DST transitions automatically.
+    
+    Args:
+        dt: Naive datetime in local time
+        local_tz_str: Timezone string (e.g., "America/Chicago")
+    
+    Returns:
+        Datetime in UTC
+    """
+    if dt is None:
+        return None
+    
+    local_tz = pytz.timezone(local_tz_str)
+    
+    try:
+        # Localize the naive datetime (handles DST)
+        local_dt = local_tz.localize(dt, is_dst=None)
+    except pytz.exceptions.AmbiguousTimeError:
+        # During fall-back, assume standard time
+        local_dt = local_tz.localize(dt, is_dst=False)
+    except pytz.exceptions.NonExistentTimeError:
+        # During spring-forward, shift forward
+        local_dt = local_tz.localize(dt, is_dst=True)
+    
+    # Convert to UTC
+    utc_dt = local_dt.astimezone(pytz.UTC)
+    
+    return utc_dt.replace(tzinfo=None)  # Return naive UTC datetime
+
+
+def format_utc_timestamp(dt: datetime) -> str:
+    """
+    Format datetime as UTC timestamp string.
+    
+    Args:
+        dt: Datetime object (assumed to be UTC)
+    
+    Returns:
+        String in format "2025-04-05T00:00:00Z"
+    """
+    if dt is None:
+        return None
+    return dt.strftime(Config.TIMESTAMP_OUTPUT_FORMAT)
+
+
+def parse_and_convert_to_utc(
+    date_str: str, 
+    time_str: Optional[str] = None,
+    is_utc: bool = False,
+    local_tz: str = "America/Chicago"
+) -> Optional[str]:
+    """
+    Parse a datetime string and convert to UTC timestamp.
+    
+    Args:
+        date_str: Date string or combined datetime string
+        time_str: Optional separate time string
+        is_utc: If True, assume input is already UTC
+        local_tz: Local timezone for conversion
+    
+    Returns:
+        UTC timestamp string or None
+    """
+    dt = parse_flexible_datetime(date_str, time_str)
+    
+    if dt is None:
+        return None
+    
+    if not is_utc:
+        dt = convert_local_to_utc(dt, local_tz)
+    
+    return format_utc_timestamp(dt)
 
 
 # ============================================
@@ -180,13 +412,13 @@ class HeartRateProcessor:
     """
     Process Fitbit heart rate files.
     
-    Input format (from Fitbit):
+    Input format (from Fitbit - already in UTC):
         timestamp, beats per minute
-        2025-04-10T00:00:01Z, 67
+        2025-04-04T00:00:08Z, 67
     
-    Output format (for DataLoader.load_fitbit_hr):
+    Output format:
         timestamp, beats per minute
-        2025-04-10T00:00:01Z, 67
+        2025-04-04T00:00:08Z, 67
     """
     
     def __init__(self):
@@ -256,9 +488,28 @@ class HeartRateProcessor:
             print(f"    Available: {list(df.columns)}")
             return None
         
-        # Create output DataFrame with expected column names
+        # Create output DataFrame
         result = pd.DataFrame()
-        result["timestamp"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+        
+        # Heart rate timestamps are already in UTC - just standardize format
+        timestamps = []
+        for ts in df[ts_col]:
+            if pd.isna(ts):
+                timestamps.append(None)
+                continue
+            
+            ts_str = str(ts).strip()
+            
+            # If already has Z suffix, it's UTC
+            if ts_str.endswith('Z'):
+                dt = parse_flexible_datetime(ts_str)
+                timestamps.append(format_utc_timestamp(dt) if dt else None)
+            else:
+                # Fitbit data should be UTC, but parse and format consistently
+                dt = parse_flexible_datetime(ts_str)
+                timestamps.append(format_utc_timestamp(dt) if dt else None)
+        
+        result["timestamp"] = timestamps
         result["beats per minute"] = pd.to_numeric(df[hr_col], errors="coerce")
         
         # Remove invalid rows
@@ -318,13 +569,15 @@ class WristTemperatureProcessor:
     """
     Process Fitbit wrist/skin temperature files.
     
-    Input format (from Fitbit):
+    Input format (from Fitbit - LOCAL TIME):
         recorded_time, temperature
-        2025-05-30T00:00, -2.095291443
+        2025-04-04T00:00, -2.095291443
     
-    Output format (for DataLoader.load_fitbit_skin_temp):
-        recorded_time, temperature
-        2025-05-30T00:00, -2.095291443
+    Output format (converted to UTC):
+        timestamp, temperature
+        2025-04-04T05:00:00Z, -2.095291443
+    
+    Note: Temperature is a deviation from baseline, not absolute temperature.
     """
     
     def __init__(self):
@@ -353,8 +606,8 @@ class WristTemperatureProcessor:
         for user_id in self.data:
             self.data[user_id] = (
                 self.data[user_id]
-                .sort_values("recorded_time")
-                .drop_duplicates(subset=["recorded_time"], keep="first")
+                .sort_values("timestamp")
+                .drop_duplicates(subset=["timestamp"], keep="first")
                 .reset_index(drop=True)
             )
             print(f"    {user_id}: {len(self.data[user_id]):,} samples")
@@ -378,14 +631,9 @@ class WristTemperatureProcessor:
         # Find timestamp column
         ts_col = None
         for c in df.columns:
-            if "recorded" in c:
+            if "recorded" in c or "timestamp" in c or "time" in c:
                 ts_col = c
                 break
-        if ts_col is None:
-            for c in df.columns:
-                if "timestamp" in c or "time" in c:
-                    ts_col = c
-                    break
         
         # Find temperature column
         temp_col = None
@@ -399,12 +647,23 @@ class WristTemperatureProcessor:
             print(f"    Available: {list(df.columns)}")
             return None
         
-        # Create output DataFrame with expected column names
+        # Create output DataFrame
         result = pd.DataFrame()
-        result["recorded_time"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+        
+        # Convert local timestamps to UTC
+        timestamps = []
+        for ts in df[ts_col]:
+            utc_ts = parse_and_convert_to_utc(
+                str(ts) if not pd.isna(ts) else None,
+                is_utc=False,
+                local_tz=Config.LOCAL_TIMEZONE
+            )
+            timestamps.append(utc_ts)
+        
+        result["timestamp"] = timestamps
         result["temperature"] = pd.to_numeric(df[temp_col], errors="coerce")
         
-        result = result.dropna(subset=["recorded_time"])
+        result = result.dropna(subset=["timestamp"])
         
         return result
     
@@ -432,7 +691,7 @@ class WristTemperatureProcessor:
                 combined_df.append(df_copy)
             
             combined_df = pd.concat(combined_df, ignore_index=True)
-            combined_df = combined_df.sort_values(["user_id", "recorded_time"]).reset_index(drop=True)
+            combined_df = combined_df.sort_values(["user_id", "timestamp"]).reset_index(drop=True)
             
             filepath = all_users_dir / Config.SKIN_TEMP_OUTPUT
             combined_df.to_csv(filepath, index=False)
@@ -449,16 +708,16 @@ class EnvironmentalProcessor:
     """
     Process Govee environmental monitor files.
     
-    Input format (from Govee):
+    Input format (from Govee - LOCAL TIME):
         Timestamp for sample frequency every 1 min min, PM2.5(µg/m³), Temperature_Fahrenheit, Relative_Humidity
-        2025-04-07 16:51:00, 0, 69.98, 50.6
+        2025-04-05 00:00:00, 0, 69.98, 50.6
     
-    Output format (for DataLoader.load_govee_env):
-        Timestamp for sample frequency every 1 min min, Temperature_Fahrenheit, Relative_Humidity
-        2025-04-07 16:51:00, 69.98, 50.6
+    Output format (converted to UTC, temperature kept in Fahrenheit):
+        timestamp, Temperature_Fahrenheit, Relative_Humidity
+        2025-04-05T05:00:00Z, 69.98, 50.6
     
-    Note: Keep temperature in Fahrenheit - DataLoader will convert to Celsius.
     Note: PM2.5 is dropped as it's not used.
+    Note: Temperature is kept in Fahrenheit - DataLoader will convert if needed.
     """
     
     def __init__(self):
@@ -487,8 +746,8 @@ class EnvironmentalProcessor:
         for user_id in self.data:
             self.data[user_id] = (
                 self.data[user_id]
-                .sort_values("Timestamp for sample frequency every 1 min min")
-                .drop_duplicates(subset=["Timestamp for sample frequency every 1 min min"], keep="first")
+                .sort_values("timestamp")
+                .drop_duplicates(subset=["timestamp"], keep="first")
                 .reset_index(drop=True)
             )
             print(f"    {user_id}: {len(self.data[user_id]):,} samples")
@@ -506,9 +765,9 @@ class EnvironmentalProcessor:
         if df.empty:
             return None
         
-        # Normalize column names for detection (but we'll rename to expected format)
+        # Normalize column names for detection
         original_columns = df.columns.tolist()
-        df.columns = (
+        normalized_columns = (
             df.columns
             .str.normalize("NFKC")
             .str.replace("\u00A0", " ", regex=False)
@@ -516,23 +775,27 @@ class EnvironmentalProcessor:
             .str.strip()
         )
         
+        # Create column mapping
+        col_map = {norm: orig for norm, orig in zip(normalized_columns, original_columns)}
+        df.columns = normalized_columns
+        
         # Find columns
         ts_col = None
-        for i, c in enumerate(df.columns):
+        for c in df.columns:
             if c.startswith("timestamp") or c == "time" or c == "datetime":
-                ts_col = i
+                ts_col = c
                 break
         
         temp_col = None
-        for i, c in enumerate(df.columns):
+        for c in df.columns:
             if "temperature" in c and "pm" not in c:
-                temp_col = i
+                temp_col = c
                 break
         
         humid_col = None
-        for i, c in enumerate(df.columns):
+        for c in df.columns:
             if "humid" in c:
-                humid_col = i
+                humid_col = c
                 break
         
         if ts_col is None:
@@ -544,22 +807,30 @@ class EnvironmentalProcessor:
             print(f"    Warning: No temp/humidity in {filepath.name}")
             return None
         
-        # Build output with expected column names
+        # Build output with standardized column names
         result = pd.DataFrame()
         
-        # Parse timestamp (keep as string in expected format)
-        ts_values = pd.to_datetime(df.iloc[:, ts_col], errors="coerce")
-        result["Timestamp for sample frequency every 1 min min"] = ts_values.dt.strftime("%Y-%m-%d %H:%M:%S")
+        # Convert local timestamps to UTC
+        timestamps = []
+        for ts in df[ts_col]:
+            utc_ts = parse_and_convert_to_utc(
+                str(ts) if not pd.isna(ts) else None,
+                is_utc=False,
+                local_tz=Config.LOCAL_TIMEZONE
+            )
+            timestamps.append(utc_ts)
+        
+        result["timestamp"] = timestamps
         
         # Temperature (keep in Fahrenheit)
         if temp_col is not None:
-            result["Temperature_Fahrenheit"] = pd.to_numeric(df.iloc[:, temp_col], errors="coerce")
+            result["Temperature_Fahrenheit"] = pd.to_numeric(df[temp_col], errors="coerce")
         
         # Humidity
         if humid_col is not None:
-            result["Relative_Humidity"] = pd.to_numeric(df.iloc[:, humid_col], errors="coerce")
+            result["Relative_Humidity"] = pd.to_numeric(df[humid_col], errors="coerce")
         
-        result = result.dropna(subset=["Timestamp for sample frequency every 1 min min"])
+        result = result.dropna(subset=["timestamp"])
         
         return result
     
@@ -587,9 +858,7 @@ class EnvironmentalProcessor:
                 combined_df.append(df_copy)
             
             combined_df = pd.concat(combined_df, ignore_index=True)
-            combined_df = combined_df.sort_values(
-                ["user_id", "Timestamp for sample frequency every 1 min min"]
-            ).reset_index(drop=True)
+            combined_df = combined_df.sort_values(["user_id", "timestamp"]).reset_index(drop=True)
             
             filepath = all_users_dir / Config.ENV_OUTPUT
             combined_df.to_csv(filepath, index=False)
@@ -606,15 +875,16 @@ class CBTProcessor:
     """
     Process CBT (Core Body Temperature) label files.
     
-    Input format (manual measurements):
+    Input format (manual measurements - LOCAL TIME):
         Date:, Time:, CBT (Deg F):
         4/5/2025, 8:59 PM, 98.5
     
-    Output format (for DataLoader.load_cbt):
-        Date:, Time:, CBT (Deg F):
-        4/5/2025, 8:59 PM, 98.5
+    Output format (converted to UTC, temperature in Fahrenheit):
+        timestamp, cbt_fahrenheit
+        2025-04-06T01:59:00Z, 98.5
     
-    Note: Keep in original format - DataLoader handles timezone/unit conversion.
+    Note: Date/time combined and converted to UTC.
+    Note: Temperature kept in Fahrenheit.
     """
     
     def __init__(self):
@@ -639,7 +909,14 @@ class CBTProcessor:
                 else:
                     self.data[user_id] = df
         
+        # Sort and deduplicate per user
         for user_id in self.data:
+            self.data[user_id] = (
+                self.data[user_id]
+                .sort_values("timestamp")
+                .drop_duplicates(subset=["timestamp"], keep="first")
+                .reset_index(drop=True)
+            )
             print(f"    {user_id}: {len(self.data[user_id])} measurements")
         
         return self
@@ -656,38 +933,53 @@ class CBTProcessor:
             return None
         
         # Normalize column names for detection
-        df.columns = df.columns.str.strip()
+        original_columns = df.columns.tolist()
+        normalized = df.columns.str.lower().str.strip().str.rstrip(':')
         
-        # Find columns by pattern (handle colons in names)
+        # Find columns by pattern
         date_col = None
         time_col = None
         cbt_col = None
         
-        for c in df.columns:
-            c_lower = c.lower().rstrip(':')
-            if c_lower == "date":
-                date_col = c
-            elif c_lower == "time":
-                time_col = c
-            elif "cbt" in c_lower or "core" in c_lower or "body" in c_lower:
-                cbt_col = c
+        for i, c in enumerate(normalized):
+            if c == "date":
+                date_col = i
+            elif c == "time":
+                time_col = i
+            elif "cbt" in c or "core" in c or "body" in c:
+                cbt_col = i
         
         if date_col is None or time_col is None or cbt_col is None:
             print(f"    Warning: Missing columns in {filepath.name}")
-            print(f"    Available: {list(df.columns)}")
-            print(f"    Found: date={date_col}, time={time_col}, cbt={cbt_col}")
+            print(f"    Available: {original_columns}")
+            print(f"    Normalized: {list(normalized)}")
             return None
         
-        # Build output with expected column names
+        # Build output
         result = pd.DataFrame()
-        result["Date:"] = df[date_col].astype(str).str.strip()
-        result["Time:"] = df[time_col].astype(str).str.strip()
-        result["CBT (Deg F):"] = pd.to_numeric(df[cbt_col], errors="coerce")
         
-        # Validate CBT values are in reasonable range
+        # Convert local date/time to UTC
+        timestamps = []
+        for idx in range(len(df)):
+            date_val = df.iloc[idx, date_col]
+            time_val = df.iloc[idx, time_col]
+            
+            utc_ts = parse_and_convert_to_utc(
+                str(date_val) if not pd.isna(date_val) else None,
+                str(time_val) if not pd.isna(time_val) else None,
+                is_utc=False,
+                local_tz=Config.LOCAL_TIMEZONE
+            )
+            timestamps.append(utc_ts)
+        
+        result["timestamp"] = timestamps
+        result["cbt_fahrenheit"] = pd.to_numeric(df.iloc[:, cbt_col], errors="coerce")
+        
+        # Validate CBT values are in reasonable range (95-105°F)
+        result = result.dropna(subset=["timestamp", "cbt_fahrenheit"])
         result = result[
-            (result["CBT (Deg F):"] >= 95) & 
-            (result["CBT (Deg F):"] <= 105)
+            (result["cbt_fahrenheit"] >= 95) & 
+            (result["cbt_fahrenheit"] <= 105)
         ]
         
         return result
@@ -716,6 +1008,7 @@ class CBTProcessor:
                 combined_df.append(df_copy)
             
             combined_df = pd.concat(combined_df, ignore_index=True)
+            combined_df = combined_df.sort_values(["user_id", "timestamp"]).reset_index(drop=True)
             
             filepath = all_users_dir / Config.CBT_OUTPUT
             combined_df.to_csv(filepath, index=False)
@@ -754,6 +1047,7 @@ def run_pipeline(
     print("=" * 60)
     print(f"\nRaw data directory: {raw_data_dir}")
     print(f"Output directory: {output_dir}")
+    print(f"Local timezone: {Config.LOCAL_TIMEZONE}")
     print(f"Per-user output: {per_user}")
     print(f"Combined output: {combined}")
     print()
@@ -779,6 +1073,7 @@ def run_pipeline(
     
     # Process Heart Rate
     print("Step 2: Processing heart rate data...")
+    print("  (Already in UTC - standardizing format)")
     hr_processor = HeartRateProcessor().process_folder(hr_folder)
     hr_saved = hr_processor.save(output_dir, per_user=per_user, combined=combined)
     all_saved.update(hr_saved)
@@ -786,6 +1081,7 @@ def run_pipeline(
     
     # Process Wrist Temperature
     print("Step 3: Processing wrist temperature data...")
+    print(f"  (Converting from {Config.LOCAL_TIMEZONE} to UTC)")
     wrist_processor = WristTemperatureProcessor().process_folder(wrist_folder)
     wrist_saved = wrist_processor.save(output_dir, per_user=per_user, combined=combined)
     all_saved.update(wrist_saved)
@@ -793,6 +1089,7 @@ def run_pipeline(
     
     # Process Environmental
     print("Step 4: Processing environmental data...")
+    print(f"  (Converting from {Config.LOCAL_TIMEZONE} to UTC)")
     env_processor = EnvironmentalProcessor().process_folder(env_folder)
     env_saved = env_processor.save(output_dir, per_user=per_user, combined=combined)
     all_saved.update(env_saved)
@@ -800,6 +1097,7 @@ def run_pipeline(
     
     # Process CBT Labels
     print("Step 5: Processing CBT label data...")
+    print(f"  (Converting from {Config.LOCAL_TIMEZONE} to UTC)")
     cbt_processor = CBTProcessor().process_folder(cbt_folder)
     cbt_saved = cbt_processor.save(output_dir, per_user=per_user, combined=combined)
     all_saved.update(cbt_saved)
@@ -811,6 +1109,7 @@ def run_pipeline(
     print("=" * 60)
     
     print(f"\nOutput directory: {output_dir}")
+    print(f"\nAll timestamps converted to UTC format: YYYY-MM-DDTHH:MM:SSZ")
     
     # List users processed
     all_users = set()
@@ -831,24 +1130,18 @@ def run_pipeline(
     if per_user:
         print(f"\nPer-user files saved to: {output_dir}/<user_id>/")
     
-    print("\nFiles are ready for prepare_data.py")
-    print("Usage:")
-    print(f"  python -m src.training.prepare_data --data-dir {output_dir / 'all_users'}")
-    print("  OR for single user:")
-    print(f"  python -m src.training.prepare_data --data-dir {output_dir}/<user_id>")
-    
     return all_saved
 
 
 def validate_output(output_dir: Path) -> bool:
     """
-    Validate that output files match what prepare_data.py expects.
+    Validate that output files have correct timestamp format.
     
     Args:
         output_dir: Directory to validate
     
     Returns:
-        True if all expected files exist
+        True if all files have valid UTC timestamps
     """
     all_users_dir = output_dir / "all_users"
     
@@ -862,16 +1155,82 @@ def validate_output(output_dir: Path) -> bool:
     print("\nValidating output files...")
     all_ok = True
     
+    # UTC timestamp pattern
+    utc_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+    
     for filename in expected_files:
         filepath = all_users_dir / filename
         if filepath.exists():
             df = pd.read_csv(filepath)
-            print(f"  ✓ {filename}: {len(df):,} rows")
+            
+            # Find timestamp column
+            ts_col = None
+            for c in df.columns:
+                if 'timestamp' in c.lower():
+                    ts_col = c
+                    break
+            
+            if ts_col:
+                # Check first few timestamps
+                sample = df[ts_col].dropna().head(5)
+                valid_format = all(utc_pattern.match(str(ts)) for ts in sample)
+                
+                if valid_format:
+                    print(f"  ✓ {filename}: {len(df):,} rows, UTC format OK")
+                    print(f"    Sample: {sample.iloc[0]}")
+                else:
+                    print(f"  ✗ {filename}: Invalid timestamp format")
+                    print(f"    Sample: {sample.iloc[0] if len(sample) > 0 else 'N/A'}")
+                    all_ok = False
+            else:
+                print(f"  ✗ {filename}: No timestamp column found")
+                all_ok = False
         else:
             print(f"  ✗ {filename}: NOT FOUND")
             all_ok = False
     
     return all_ok
+
+
+def test_timestamp_parsing():
+    """Test the timestamp parsing with various formats."""
+    print("\nTesting timestamp parsing...")
+    
+    test_cases = [
+        # (input_date, input_time, expected_local_datetime)
+        ("4/5/2025", "8:59 PM", "2025-04-05 20:59:00"),
+        ("04/05/2025", "8:59 PM", "2025-04-05 20:59:00"),
+        ("4/5/25", "8:59 PM", "2025-04-05 20:59:00"),
+        ("2025-04-05", "20:59:00", "2025-04-05 20:59:00"),
+        ("2025-04-05T20:59", None, "2025-04-05 20:59:00"),
+        ("2025-04-05 00:00:00", None, "2025-04-05 00:00:00"),
+        ("4/5/2025", "12:00 AM", "2025-04-05 00:00:00"),
+        ("4/5/2025", "12:00 PM", "2025-04-05 12:00:00"),
+    ]
+    
+    for date_str, time_str, expected_local in test_cases:
+        dt = parse_flexible_datetime(date_str, time_str)
+        if dt:
+            result = dt.strftime("%Y-%m-%d %H:%M:%S")
+            status = "✓" if result == expected_local else "✗"
+            print(f"  {status} '{date_str}' + '{time_str}' -> {result} (expected: {expected_local})")
+        else:
+            print(f"  ✗ '{date_str}' + '{time_str}' -> PARSE FAILED")
+    
+    # Test UTC conversion
+    print("\nTesting UTC conversion (America/Chicago)...")
+    
+    # April 5, 2025 8:59 PM CDT (UTC-5) -> April 6, 2025 1:59 AM UTC
+    dt = parse_flexible_datetime("4/5/2025", "8:59 PM")
+    utc_dt = convert_local_to_utc(dt, "America/Chicago")
+    utc_str = format_utc_timestamp(utc_dt)
+    print(f"  April 5, 2025 8:59 PM CDT -> {utc_str}")
+    
+    # January 5, 2025 8:59 PM CST (UTC-6) -> January 6, 2025 2:59 AM UTC
+    dt = parse_flexible_datetime("1/5/2025", "8:59 PM")
+    utc_dt = convert_local_to_utc(dt, "America/Chicago")
+    utc_str = format_utc_timestamp(utc_dt)
+    print(f"  January 5, 2025 8:59 PM CST -> {utc_str}")
 
 
 # ============================================
@@ -911,10 +1270,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Only validate existing output files"
     )
+    parser.add_argument(
+        "--test-parsing",
+        action="store_true",
+        help="Test timestamp parsing functions"
+    )
     
     args = parser.parse_args()
     
-    if args.validate_only:
+    if args.test_parsing:
+        test_timestamp_parsing()
+    elif args.validate_only:
         output_dir = args.output_dir or Config.OUTPUT_DIR
         validate_output(output_dir)
     else:
