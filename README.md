@@ -133,5 +133,6 @@ cbt_pred_platform/
 
 ## Status
 
-🚧 The inference pipeline for testing CBT predictions is currently under development.
+**🚧 Under development:** The inference pipeline for testing CBT predictions is currently under development.
+
 
