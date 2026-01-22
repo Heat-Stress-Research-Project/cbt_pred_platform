@@ -129,9 +129,10 @@ cbt_pred_platform/
 ├── requirements.txt              # Top-level Python dependencies
 └── README.md                     # Repository overview and onboarding guide
 
----
 
-## 4. Status
+```
+
+## 4. Status 🚧
 
 The inference pipeline for testing CBT predictions is currently under development.
 
