@@ -83,6 +83,7 @@ If all tests pass, the pipeline is producing valid, model-compatible inputs and 
 
 ## Folder structure for cbt_pred_platform
 
+```text
 cbt_pred_platform/
 ├── data/
 │   └── raw/                      # PROSPIE-derived processed training data (external experiment)
